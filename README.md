@@ -14,7 +14,7 @@ Hi — I'm building this in public. PhysEval-Agent is my attempt to answer one q
 Ask a code LLM to "simulate a power grid" or "run an advection scheme" and you'll usually
 get something that *looks* right: clean APIs, confident comments, plausible plots. Then you
 check the physics and the bus doesn't balance, the tracer leaks mass every timestep, or the
-Courant number is 12. The model optimized for *plausibility*, not conservation laws — and
+Courant number is 12. The model optimized for *plausibility*, not conservation laws and
 nothing in a standard training loop ever told it otherwise.
 
 RLVR (reinforcement learning with verifiable rewards) changes that: instead of a learned
@@ -27,9 +27,9 @@ So the loop here is:
 1. An agent writes simulation code for a task with exact numeric parameters.
 2. The code runs in a locked-down subprocess sandbox.
 3. Deterministic oracles check the exported state against physical invariants.
-4. Failures return a *structured JSON diagnostic* — not "wrong, try again", but
+4. Failures return a *structured JSON diagnostic* not "wrong, try again", but
    "bus `bus3` imbalanced by 12.4 MW at snapshot 17; tolerance is 1e-4".
-5. The repair attempt, the diagnostics, and the eventual fix all get logged —
+5. The repair attempt, the diagnostics, and the eventual fix all get logged,
    which means every rollout compiles into PRM step labels, DPO preference pairs,
    and SFT demonstrations. The benchmark *is* the dataset factory.
 
@@ -57,7 +57,7 @@ So the loop here is:
 git clone https://github.com/giavytday/PhysEval-Agent.git
 cd PhysEval-Agent
 
-# Core framework — schemas, sandbox, oracles. Heavy deps are lazy-imported.
+# Core framework, schemas, sandbox, oracles. Heavy deps are lazy-imported.
 pip install -e .
 
 # What each stage needs:
