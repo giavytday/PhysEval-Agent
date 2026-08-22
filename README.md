@@ -2,7 +2,7 @@
 
 **Reinforcement learning with verifiable physical invariants (RLVR) for climate & energy systems.**
 
-Hi — I'm building this in public. PhysEval-Agent is my attempt to answer one question:
+Hi, I'm building this in public. PhysEval-Agent is my attempt to answer one question:
 **can an LLM agent actually learn to stop hallucinating physics?**
 
 [![status](https://img.shields.io/badge/status-active--development-orange)](#current-scope--whats-next)
