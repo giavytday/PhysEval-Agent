@@ -95,7 +95,7 @@ def parse_records(results_path: str | Path) -> Tuple[List[TaskEvalRecord], int]:
                 continue
             try:
                 records.append(TaskEvalRecord.model_validate(json.loads(line)))
-            except Exception as exc:  # noqa: BLE001 -- tolerate partial result files
+            except Exception as exc:
                 malformed += 1
                 LOGGER.warning("Skipping malformed record at line %d: %s", lineno, exc)
     return records, malformed

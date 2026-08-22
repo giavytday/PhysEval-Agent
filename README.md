@@ -1,283 +1,177 @@
-# PhysEval-Agent: Reinforcement Learning with Verifiable Physical Invariants for Climate & Energy Systems
+# PhysEval-Agent
 
-[![CI](https://img.shields.io/badge/CI-e2e--smoke-green)](#verification)
+**Reinforcement learning with verifiable physical invariants (RLVR) for climate & energy systems.**
+
+Hi — I'm building this in public. PhysEval-Agent is my attempt to answer one question:
+**can an LLM agent actually learn to stop hallucinating physics?**
+
+[![status](https://img.shields.io/badge/status-active--development-orange)](#current-scope--whats-next)
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#quickstart)
-[![license](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
+[![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
-**PhysEval-Agent** is an open-source, deterministic scientific execution and
-verification framework for training and benchmarking LLM agents on climate and
-power-systems modeling. Generated simulation code is executed inside an
-isolated subprocess sandbox, its exported state artifacts are checked against
-*exact* physical invariants (Kirchhoff's law, Courant–Friedrichs–Lewy
-stability, Arrhenius cyclic steady state), and structured violation payloads
-are fed back to the model for multi-turn self-correction. Every rollout is
-logged as a dense trajectory that compiles directly into PRM / DPO / SFT
-training data.
+## Why this exists
 
----
+Ask a code LLM to "simulate a power grid" or "run an advection scheme" and you'll usually
+get something that *looks* right: clean APIs, confident comments, plausible plots. Then you
+check the physics and the bus doesn't balance, the tracer leaks mass every timestep, or the
+Courant number is 12. The model optimized for *plausibility*, not conservation laws — and
+nothing in a standard training loop ever told it otherwise.
 
-## Architecture
+RLVR (reinforcement learning with verifiable rewards) changes that: instead of a learned
+reward model guessing whether code is good, you use **deterministic oracles as the reward
+function**. Conservation laws don't have opinions. Kirchhoff's current law either balances
+to within 1e-4 MW or it doesn't.
+
+So the loop here is:
+
+1. An agent writes simulation code for a task with exact numeric parameters.
+2. The code runs in a locked-down subprocess sandbox.
+3. Deterministic oracles check the exported state against physical invariants.
+4. Failures return a *structured JSON diagnostic* — not "wrong, try again", but
+   "bus `bus3` imbalanced by 12.4 MW at snapshot 17; tolerance is 1e-4".
+5. The repair attempt, the diagnostics, and the eventual fix all get logged —
+   which means every rollout compiles into PRM step labels, DPO preference pairs,
+   and SFT demonstrations. The benchmark *is* the dataset factory.
+
+## System flow
 
 ```text
-                        ┌─────────────────────────────────────────────┐
-                        │  Task Synthesis (PhysicsTaskSynthesizer)    │
-                        │  600 parameterized scenarios                │
-                        │  grid | climate | kinetics                  │
-                        └──────────────────────┬──────────────────────┘
-                                               │ task spec (exact constants)
-                                               ▼
-┌──────────────────┐   code   ┌──────────────────────────┐   state.nc
-│  LLM Agent       │ ───────► │  Subprocess Sandbox      │ ─────────┐
-│  (any OpenAI-    │ ◄─────── │  python -I · rlimits     │          │
-│   compatible)    │  repair  │  killpg timeout · mock   │          ▼
-└──────────────────┘  context └──────────────────────────┘   ┌─────────────────────────────┐
-        ▲                                                    │  Oracle Invariant           │
-        │  structured JSON diagnostics                       │  Verification               │
-        │  (violations + exact metrics)                      │                             │
-        │                                                    │  ⚡ Kirchhoff nodal balance  │
-        │                                                    │  🌀 CFL stability            │
-        │                                                    │  ⚗️  Arrhenius steady state  │
-        │                                                    └──────────────┬──────────────┘
-        │                                                                   │ pass / fail
-        │            ┌────────────────────────────────────────┐             │
-        └────────────│  Multi-Turn Self-Correction Loop       │ ◄───────────┘
-                     │  Generate → Execute → Verify → Correct │
-                     │  (max_turns, default 4)                │
-                     └───────────────────┬────────────────────┘
-                                         │ Trajectory (per-turn evidence)
-                                         ▼
-        ┌──────────────────────────────────────────────────────────────┐
-        │  Data flywheel                                               │
-        │  prm_steps.jsonl · dpo_pairs.jsonl · eval_results.jsonl      │
-        │      → distillation (SFT/DPO + LoRA/QLoRA)                   │
-        │      → HF Hub release (PhysEval-Bench, Phys-PRM-100k, ...)   │
-        │      → markdown + PNG performance reports                    │
-        └──────────────────────────────────────────────────────────────┘
+┌────────────────────┐      ┌─────────────────────┐      ┌──────────────────────────┐
+│   Task Generator   │      │   Subprocess Sandbox │      │   Physics Oracle         │
+│  seeded synthesis  │      │  python -I · rlimits │      │  ⚡ Kirchhoff balance     │
+│  grid | climate |  ├─────►│  killpg timeout ·    ├─────►│  🌀 CFL stability         │
+│  kinetics (600+)   │ code │  scratch dirs only   │ .nc  │  ⚗️ Arrhenius steady state│
+└────────────────────┘      └─────────────────────┘      └───────────┬──────────────┘
+                                                                     │ verdict +
+                                                                     ▼ violations
+┌────────────────────────────────────────────┐      ┌──────────────────────────────┐
+│   Dataset Export                           │ ◄────│   Diagnostic Repair Loop     │
+│  prm_steps.jsonl · dpo_pairs.jsonl ·       │      │  structured JSON feedback →  │
+│  eval_results.jsonl → reports/charts       │      │  targeted patch (≤ k turns)  │
+└────────────────────────────────────────────┘      └──────────────────────────────┘
 ```
-
----
 
 ## Quickstart
 
-### Installation
-
 ```bash
-git clone https://github.com/physeval/physeval-agent.git
-cd physeval-agent
+git clone https://github.com/giavytday/PhysEval-Agent.git
+cd PhysEval-Agent
 
-# Core framework (schemas, sandbox, oracles)
+# Core framework — schemas, sandbox, oracles. Heavy deps are lazy-imported.
 pip install -e .
 
-# Domain extras
-pip install -e ".[grid,climate]"     # PyPSA + xarray verifiers
-pip install -e ".[llm]"              # OpenAI-compatible rollouts
-pip install -e ".[all]"              # everything scientific + LLM
+# What each stage needs:
+pip install -e ".[climate]"   # xarray oracles        (py3.9 OK)
+pip install -e ".[grid]"      # PyPSA oracle          (needs py>=3.10 wheels)
+pip install -e ".[llm]"       # OpenAI-compatible clients
+pip install -e ".[all]"       # everything at once
 
-# Optional stages
-pip install -e ".[train]"            # TRL / PEFT distillation
-pip install -e ".[hub]"              # Hugging Face releases
-pip install -e ".[report]"           # matplotlib charts
-```
+# Hermetic end-to-end test — no API key, no network, ~2.5 min:
+pytest tests/test_end_to_end.py -v        # 6 passed, warnings = errors
 
-Python **3.9+**; heavy dependencies are lazy-imported per stage.
+# Full pipeline, offline (deterministic mock LLM proves the plumbing):
+./run_pipeline.sh --smoke-test            # artifacts under runs/pipeline/
 
-### One-command pipeline (hermetic smoke test, no API key required)
-
-```bash
-./run_pipeline.sh --smoke-test
-# 5 steps: synthesize(3) → rollouts(mock) → export → evaluate → report
-# Artifacts land under runs/pipeline/
-```
-
-Full-scale run against a real model:
-
-```bash
+# Live generation against any OpenAI-compatible endpoint:
 export OPENAI_API_KEY=sk-...
-./run_pipeline.sh --full --model gpt-4o-mini --concurrency 4
+python -m physeval.run_rollouts --suite tasks/benchmark_suite.jsonl \
+    --client openai --model your-model -o trajectories.jsonl --concurrency 16
 ```
 
-### Step-by-step
+More detail lives in [README archive of CLI examples below](#cli-cheatsheet).
 
-```bash
-# 1. Synthesize a benchmark suite (deterministic, seeded)
-python -m physeval.tasks.synthesizer --total 600 --seed 42 \
-       --out physeval/tasks/benchmark_suite.jsonl
+## The three invariant families
 
-# 2. Batch rollouts with oracle-in-the-loop self-correction
-python -m physeval.run_rollouts --suite physeval/tasks/benchmark_suite.jsonl \
-       --model gpt-4o-mini --concurrency 4 --max-turns 4 \
-       --output trajectories.jsonl
+Every oracle is a pure function of the exported state file. Same artifact in,
+same verdict out — no randomness, no vibes.
 
-# 3. Export PRM step labels + DPO preference pairs
-python -m physeval.export_dataset --trajectories trajectories.jsonl \
-       --out-dir data/
+### ⚡ Kirchhoff nodal balance (`PyPSAGridOracle`)
 
-# 4. Standardized evaluation: Pass@1 vs Pass@k + drift reduction
-python -m physeval.eval_benchmark --suite physeval/tasks/benchmark_suite.jsonl \
-       --output eval_results.jsonl
+At every bus $b$ and snapshot $t$, device injections plus branch flows must vanish:
 
-# 5. Markdown tables + high-resolution charts
-python -m physeval.generate_report --results eval_results.jsonl --out-dir reports/
+$$\Bigl|\sum P_{\text{gen}} - \sum P_{\text{load}} + \sum P_{\text{storage}} + \sum_{\text{branches@}b} P^{ij}\Bigr| \le 10^{-4}\ \text{MW}$$
 
-# 6. Local distillation (QLoRA on Qwen2.5-Coder)
-python -m physeval.train_distill --stage sft  --method qlora \
-       --base-model Qwen/Qwen2.5-Coder-7B-Instruct --report-to wandb
-python -m physeval.train_distill --stage dpo  --method qlora \
-       --data data/dpo_pairs.jsonl --report-to wandb
+Also checked: line loading $\lvert P_{ij}\rvert \le s_{ij}^{\text{nom}} \cdot s^{\max}_{ij}$,
+generator bounds $0 \le P_g \le p_g^{\text{nom}} p^{\max}_g(t)$, and the storage SOC recursion
+including converter efficiencies ($\eta_{ch}, \eta_{dis}$), standing losses, inflow and spillage.
 
-# 7. Publish datasets to the Hugging Face Hub (dry-run by default)
-python -m physeval.push_to_hub --datasets bench,prm,dpo --org my-org
-```
+### 🌀 CFL stability (`ClimateGridOracle`)
 
----
+$$C = \frac{u_{\max}\,\Delta t}{\Delta x} \le 1.0, \qquad u_{\max} = \sqrt{u^2+v^2}$$
 
-## Physics Invariant Families
+Plus first-law tracer mass conservation $\left|(M_T - M_0)/M_0\right| \le 10^{-5}$ across
+the trajectory, and hard physical bounds: density $\rho > 0$, humidity $q \ge 0$,
+temperature $T > 0$ K.
 
-Every oracle is a pure function of the exported state file: no randomness,
-no network I/O, identical artifacts ⇒ identical verdicts.
+### ⚗️ Arrhenius steady state (`DACKineticsOracle`)
 
-### Family A — Power Grids (`PyPSAGridOracle`)
+Temperature-swing adsorption cycles with linear driving force kinetics,
 
-**Nodal active-power balance (Kirchhoff's current law).** For every bus $b$
-and snapshot $t$:
+$$\dot m = k(T)\,(q_{\text{eq}}(T,p) - m), \qquad k(T) = k_{\text{ref}} e^{-\frac{E_a}{R}\left(\frac{1}{T}-\frac{1}{T_{\text{ref}}}\right)}$$
 
-$$\Bigl|\underbrace{\textstyle\sum_{g\in b} P_g(t) - \sum_{\ell\in b} P_\ell(t) + \sum_{s\in b} P_s(t)}_{\text{device injections}} \;+\; \underbrace{\sum_{b\in\cdot} P^{ij}(t)}_{\text{branch flows}}\Bigr| \;\le\; 10^{-4}\ \text{MW}$$
+verified through three lenses: per-cycle capture balance (every kg desorbed must show up in
+`captured_cumulative`), cyclic steady state (cycle-to-cycle drift ≤ tolerance), and physical
+boundedness ($m \ge 0$, monotone capture, $T > 0$ K).
 
-Additional asserted constraints:
+## Datasets
 
-| Invariant | Condition |
-|---|---|
-| Line thermal limit | $\lvert P_{ij}(t)\rvert \le s^{\max}_{ij} = s^{\text{nom}}_{ij}\,\bar{s}_{ij}$ |
-| Generator capacity | $0 - \epsilon \le P_g(t) \le p^{\text{nom}}_g \, p^{\max}_g(t) + \epsilon$ |
-| Storage SOC recursion | $e_t = e_{t-1}(1-\sigma\Delta t) \;+\; \eta_{\text{ch}} \max(-P_t,0)\Delta t \;-\; \frac{\max(P_t,0)}{\eta_{\text{dis}}}\Delta t \;+\; (\text{inflow}-\text{spill})\Delta t$ |
+All three ship full Hugging Face dataset cards (license, taxonomy, schema, safety statement)
+via [`physeval.push_to_hub`](physeval/push_to_hub.py):
 
-### Family B — Climate Dynamics (`ClimateGridOracle`)
-
-**Courant–Friedrichs–Lewy numerical stability.**
-
-$$C \;=\; \frac{u_{\max}\,\Delta t}{\Delta x} \;\le\; 1.0$$
-
-with $u_{\max}=\sqrt{u^2+v^2}$ evaluated over the full wind-magnitude field.
-
-**First-law global tracer mass conservation** between the first and last frame:
-
-$$\left|\frac{M_T - M_0}{M_0}\right| \le 10^{-5}, \qquad M_t = \sum_{x,y,z} c(x,y,z,t)\,w(x,y,z)$$
-
-**Physical bounds:** density $\rho > 0$, specific humidity $q \ge 0$,
-absolute temperature $T > 0\,$K (implausible-range warnings outside 50–500 K).
-
-### Family C — Carbon Kinetics (`DACKineticsOracle`)
-
-**Arrhenius-corrected linear driving force** on the sorbent bed loading $m$:
-
-$$\frac{dm}{dt} = k(T)\,\bigl(q_{\text{eq}}(T,p) - m\bigr), \qquad k(T) = k_{\text{ref}} \exp\!\Bigl[-\frac{E_a}{R}\Bigl(\frac{1}{T} - \frac{1}{T_{\text{ref}}}\Bigr)\Bigr]$$
-
-with Langmuir equilibrium affinity following van't Hoff: $b(T) = b_0 \exp\bigl[\tfrac{\Delta H}{R}\bigl(\tfrac{1}{T} - \tfrac{1}{T_{\text{ref}}}\bigr)\bigr]$ (exothermic ⇒ affinity decreases with $T$).
-
-**Cyclic steady-state tolerance.** With cycle throughput scale
-$\Phi_c = \max(\text{captured}_c,\ \text{desorbed}_c)$:
-
-$$\frac{|m^{\text{end}}_c - m^{\text{start}}_c|}{\Phi_c} \le \tau_{\text{ss}}, \qquad \frac{|\,\text{captured}_c - \text{captured}_{c-1}\,|}{\text{captured}_{c-1}} \le \tau_{\text{ss}}$$
-
-**Per-cycle capture balance:** every kilogram desorbed during regeneration
-must appear in `captured_cumulative`:
-
-$$\Bigl|\,\Delta\,\text{captured}\big|_{c} - \sum_{t \in c}\max(-\Delta m_t, 0)\Bigr| \le \epsilon_{\text{bal}}$$
-
-plus physical boundedness $m_t \ge 0$, monotone capture, $T > 0$ K.
-
----
-
-## Benchmark Tasks
-
-| Task id | Domain | Difficulty | Verifier | Core challenge |
-|---|---|---|---|---|
-| `grid_24h_curtailment` | PyPSA | hard | `PyPSAGridOracle` | Economic dispatch of a 5-bus wind+battery ring without line overloads |
-| `tracer_advection_2d` | xarray | medium | `ClimateGridOracle` | Flux-form advection of a Gaussian blob in a vortex field, mass-exact |
-| `direct_air_capture_kinetics` | kinetics | hard | `DACKineticsOracle` | Multistage TSA cycles to cyclic steady state |
-| `*_synth_*` (600) | all | easy→hard | all three | Seeded parameterized suite (`tasks/benchmark_suite.jsonl`) |
-
----
-
-## Dataset & Benchmark Cards (Hugging Face Hub)
-
-Released via [`physeval.push_to_hub`](physeval/push_to_hub.py); each artifact
-ships a full dataset card (license, citation, taxonomy, schema, safety).
-
-| Repository | Contents | Row schema highlights |
+| Repo | What's inside | Key columns |
 |---|---|---|
-| **`PhysEval-Bench`** | The clean 600-task evaluation benchmark | `id`, `domain`, `description` (all constants embedded), `requirements`, `artifact_filename`, `difficulty`, `params`, `oracle_kwargs` |
-| **`Phys-PRM-100k`** | Step-level process reward supervision with oracle error traces | `prompt`, `completion`, `code_span_chars`, `fatal_violations[{name, observed_value, threshold}]`, `metrics`, binary `reward ∈ {0.0, 1.0}` |
-| **Phys-DPO-Pairs** | Preference pairs: unverified first attempt vs. oracle-corrected patch | `prompt` (shared diagnostic condition), `rejected`, `chosen`, `rejected_failure_mode`, `turns_to_recover` |
-
-Safety & provenance statement (included in every card): fully synthetic seeded
-parameters, zero personal data, labels derived exclusively from deterministic
-physics oracles executed in isolated sandboxes.
+| `PhysEval-Bench` | 600 seeded tasks (200 grid / 200 climate / 200 kinetics), exact constants embedded | `description`, `requirements`, `artifact_filename`, `oracle_kwargs`, `params` |
+| `Phys-PRM-100k` | Step-level process supervision with full oracle error traces | `prompt`, `completion`, `code_span_chars`, `fatal_violations[{name, observed_value, threshold}]`, binary `reward` |
+| `Phys-DPO-Pairs` | Failed unverified code paired with its oracle-corrected fix | `prompt` (shared repair context), `rejected`, `chosen`, `rejected_failure_mode`, `turns_to_recover` |
 
 ```python
 from datasets import load_dataset
-bench = load_dataset("your-org/PhysEval-Bench", split="train")
-prm   = load_dataset("your-org/Phys-PRM-100k", split="train")
-dpo   = load_dataset("your-org/Phys-DPO-Pairs", split="train")
+bench = load_dataset("<owner>/PhysEval-Bench", split="train")
 ```
 
----
+Latest local validation run (600 tasks, deterministic mock LLM — this validates the
+*harness*, not any model's physics ability): Pass@1 0.00% → Pass@3 **66.67%**, mean
+conservation-drift reduction **100%** on 400 measured tasks, 1,400 PRM steps /
+~441k completion tokens, 400 DPO pairs. Grid domain scored 0% here solely because PyPSA
+can't execute on this machine's Python 3.9 — see caveats below.
 
-## Repository Layout
+## Current scope — what's next
 
-```text
-physeval/
-├── oracle/            # deterministic verifiers
-│   ├── base.py            # Pydantic v2 schemas + BasePhysicsOracle ABC
-│   ├── grid_invariants.py # Kirchhoff · thermal · capacity · SOC recursion
-│   ├── climate_invariants.py  # tracer mass · bounds · CFL
-│   └── (seed_tasks.py hosts DACKineticsOracle for TSA cycles)
-├── sandbox/executor.py    # subprocess isolation, timeouts, artifact discovery
-├── agent/
-│   ├── prompts.py         # generation contract + strict-JSON repair prompts
-│   ├── loop.py            # AsyncPhysEvalLoop (Generate→Execute→Verify→Correct)
-│   └── ...
-├── tasks/synthesizer.py   # 600-task seeded generator
-├── mock_client.py         # offline deterministic LLM stand-in
-├── run_rollouts.py        # async batch rollout CLI → JSONL
-├── export_dataset.py      # PRM + DPO formatters + stats
-├── eval_benchmark.py      # Pass@1 vs Pass@k + drift reduction
-├── generate_report.py     # markdown tables + PNG charts
-├── train_distill.py       # SFT/DPO harness (LoRA/QLoRA, W&B/TensorBoard)
-└── push_to_hub.py         # dataset/model release pipeline
-tests/test_end_to_end.py   # hermetic integration suite
-run_pipeline.sh            # 5-step master runner (--smoke-test / --full)
-```
+Honest status, because that's the point of building in public:
 
-## Verification
+**Works today:** the full Generate → Execute → Verify → Correct loop; three oracle families
+with unit-tested failure detection; hermetic CI-style integration test (6 stages, zero
+warnings, NaN-rejecting JSON parsing); PRM/DPO/SFT export; report charts; HF release tooling;
+QLoRA distillation harness (code-complete, untested against real GPUs yet).
 
-The hermetic end-to-end suite drives one task per domain through every stage
-using real CLI entry points and asserts schema conformance, NaN-free JSONL,
-reward sanity, pass-rate invariants, and chart generation — with warnings
-escalated to errors (`filterwarnings = ["error"]`):
+**Known limitations:**
+- Grid verification needs PyPSA, whose modern wheels require Python ≥ 3.10 — everything else
+  runs on 3.9+.
+- The sandbox is process-isolated (own session, rlimits, wall-clock kill), **not**
+  container-isolated. Fine for research; use a container/gVisor wrapper before pointing it at
+  truly adversarial outputs.
+- All published metrics so far come from the deterministic mock client. There are no real
+  model numbers yet — that's literally the next milestone.
+
+**Next up:** first live rollouts against a real instruct model · PRM reward-model training
+on `Phys-PRM-100k` · DPO distillation run · scaling the synthesized suite beyond 600 ·
+container-based sandbox option.
+
+## CLI cheatsheet
 
 ```bash
-pytest tests/test_end_to_end.py -v
-# 6 passed — rollouts · export · evaluation · report · shell runner
-
-# full unit + functional matrix
-pytest tests/ -q        # plus external unit suites if present
-```
-
-## Citation
-
-If you use PhysEval-Agent, please cite:
-
-```bibtex
-@misc{physeval2026,
-  title        = {PhysEval-Agent: Reinforcement Learning with Verifiable
-                  Physical Invariants for Climate \& Energy Systems},
-  author       = {PhysEval-Agent Contributors},
-  year         = {2026},
-  howpublished = {\url{https://github.com/physeval/physeval-agent}},
-}
+python -m physeval.tasks.synthesizer --total 600 --seed 42 -o tasks/benchmark_suite.jsonl
+python -m physeval.run_rollouts --suite tasks/benchmark_suite.jsonl \
+    --client openai --model <model> -o trajectories.jsonl --concurrency 16
+python -m physeval.export_dataset --input trajectories.jsonl --out-dir data/
+python -m physeval.eval_benchmark --suite tasks/benchmark_suite.jsonl --output eval_results.jsonl
+python -m physeval.generate_report --input eval_results.jsonl --out-dir reports/
+python -m physeval.train_distill --stage sft --method qlora --report-to wandb
+python -m physeval.train_distill --stage dpo --method qlora --report-to wandb
+python -m physeval.push_to_hub --datasets bench,prm,dpo
+./run_pipeline.sh --smoke-test | --full [--base-url https://openrouter.ai/api/v1]
 ```
 
 ## License
 
-MIT — see [pyproject.toml](pyproject.toml).
+MIT — see [LICENSE](LICENSE).

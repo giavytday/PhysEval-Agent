@@ -6,7 +6,8 @@
 * an isolated-mode interpreter (``python -I``) and a minimal, hash-seeded
   environment for reproducibility,
 * wall-clock timeout enforcement with whole-process-group kill on expiry,
-* an optional address-space cap (POSIX ``setrlimit(RLIMIT_AS)``),
+* an optional address-space cap (POSIX ``setrlimit(RLIMIT_AS)``, applied by a
+  trusted in-child bootstrap so the parent never needs ``preexec_fn``),
 * stdout/stderr capture with bounded memory footprint,
 * automatic discovery of exported state artifacts (``*.nc``, ``*.h5``,
   ``*.zarr``, ...).
@@ -59,6 +60,34 @@ _SANDBOX_ENV: Dict[str, str] = {
     "NUMEXPR_NUM_THREADS": "1",
     "LANG": "C.UTF-8",
 }
+
+#: Trusted in-child bootstrap. Applies POSIX rlimits *inside* the executed
+#: interpreter (never via ``preexec_fn``, which is unsafe after fork in
+#: multithreaded parents) and only then runs the untrusted script.
+_SANDBOX_BOOTSTRAP = """\
+import resource
+import runpy
+import sys
+
+mem_bytes, cpu_seconds, script = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    if int(mem_bytes) > 0:
+        limit = int(mem_bytes)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    if int(cpu_seconds) > 0:
+        soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
+        cap = int(cpu_seconds)
+        resource.setrlimit(
+            resource.RLIMIT_CPU,
+            (min(soft, cap) if soft > 0 else cap,
+             min(hard, cap) if hard > 0 else cap),
+        )
+except Exception:
+    pass  # best effort; platforms differ (e.g. macOS RLIMIT_AS quirks)
+
+sys.argv = [script]
+runpy.run_path(script, run_name="__main__")
+"""
 
 #: Cap on captured stream size (characters); head+tail are preserved.
 _STREAM_CAPTURE_LIMIT = 100_000
@@ -175,7 +204,9 @@ class CodeExecutor:
         self.keep_workdirs = keep_workdirs
         self.python_executable = python_executable or sys.executable
         self._managed_dirs: List[Path] = []
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            os.chmod(self.base_dir, 0o700)
 
     # ------------------------------------------------------------------ #
     # Public API                                                         #
@@ -186,6 +217,8 @@ class CodeExecutor:
         rid = run_id or uuid.uuid4().hex[:12]
         workdir = self.base_dir / f"run_{rid}"
         workdir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(workdir, 0o700)
         self._managed_dirs.append(workdir)
 
         # Preflight: catch syntax errors deterministically before spawning.
@@ -256,27 +289,23 @@ class CodeExecutor:
         env["TMPDIR"] = str(workdir)
         return env
 
-    def _child_limits(self) -> None:  # pragma: no cover - runs in child
-        """Apply POSIX rlimits inside the forked child (preexec)."""
-        try:
-            import resource
-
-            if self.mem_limit_mb is not None:
-                limit = int(self.mem_limit_mb) * 1024 * 1024
-                resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-            soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
-            cpu_cap = max(int(self.timeout_s) * 2 + 10, 30)
-            resource.setrlimit(
-                resource.RLIMIT_CPU,
-                (min(soft, cpu_cap) if soft > 0 else cpu_cap,
-                 min(hard, cpu_cap) if hard > 0 else cpu_cap),
-            )
-        except Exception:
-            # Best effort only; platforms differ (e.g. macOS RLIMIT_AS quirks).
-            pass
-
     def _spawn_and_wait(self, script_path: Path, workdir: Path) -> ExecutionResult:
-        cmd = [self.python_executable, "-I", "-B", str(script_path)]
+        # Rlimits are applied by the trusted in-child bootstrap (never via
+        # preexec_fn, which is unsafe after fork in multithreaded parents);
+        # start_new_session detaches the child into its own process group so
+        # timeouts can kill the whole tree with one SIGKILL.
+        cpu_cap = max(int(self.timeout_s) * 2 + 10, 30)
+        mem_bytes = int(self.mem_limit_mb) * 1024 * 1024 if self.mem_limit_mb else 0
+        cmd = [
+            self.python_executable,
+            "-I",
+            "-B",
+            "-c",
+            _SANDBOX_BOOTSTRAP,
+            str(mem_bytes),
+            str(cpu_cap),
+            str(script_path),
+        ]
         popen_kwargs: Dict[str, Any] = dict(
             cwd=str(workdir),
             env=self._build_env(workdir),
@@ -288,10 +317,6 @@ class CodeExecutor:
         )
         if os.name == "posix":
             popen_kwargs["start_new_session"] = True
-            preexec = self._child_limits
-        else:
-            preexec = None
-        popen_kwargs["preexec_fn"] = preexec
 
         proc = subprocess.Popen(cmd, **popen_kwargs)
         timed_out = False
