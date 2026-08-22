@@ -83,7 +83,7 @@ More detail lives in [README archive of CLI examples below](#cli-cheatsheet).
 ## The three invariant families
 
 Every oracle is a pure function of the exported state file. Same artifact in,
-same verdict out — no randomness, no vibes.
+same verdict out, no randomness, no vibes.
 
 ### ⚡ Kirchhoff nodal balance (`PyPSAGridOracle`)
 
@@ -129,13 +129,13 @@ from datasets import load_dataset
 bench = load_dataset("<owner>/PhysEval-Bench", split="train")
 ```
 
-Latest local validation run (600 tasks, deterministic mock LLM — this validates the
+Latest local validation run (600 tasks, deterministic mock LLM, this validates the
 *harness*, not any model's physics ability): Pass@1 0.00% → Pass@3 **66.67%**, mean
 conservation-drift reduction **100%** on 400 measured tasks, 1,400 PRM steps /
 ~441k completion tokens, 400 DPO pairs. Grid domain scored 0% here solely because PyPSA
 can't execute on this machine's Python 3.9 — see caveats below.
 
-## Current scope — what's next
+## Current scope, what's next
 
 Honest status, because that's the point of building in public:
 
@@ -145,13 +145,13 @@ warnings, NaN-rejecting JSON parsing); PRM/DPO/SFT export; report charts; HF rel
 QLoRA distillation harness (code-complete, untested against real GPUs yet).
 
 **Known limitations:**
-- Grid verification needs PyPSA, whose modern wheels require Python ≥ 3.10 — everything else
+- Grid verification needs PyPSA, whose modern wheels require Python ≥ 3.10, everything else
   runs on 3.9+.
 - The sandbox is process-isolated (own session, rlimits, wall-clock kill), **not**
   container-isolated. Fine for research; use a container/gVisor wrapper before pointing it at
   truly adversarial outputs.
 - All published metrics so far come from the deterministic mock client. There are no real
-  model numbers yet — that's literally the next milestone.
+  model numbers yet, that's literally the next milestone.
 
 **Next up:** first live rollouts against a real instruct model · PRM reward-model training
 on `Phys-PRM-100k` · DPO distillation run · scaling the synthesized suite beyond 600 ·
